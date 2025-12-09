@@ -2,30 +2,30 @@ import discord
 from discord.ext import commands, tasks
 import json
 import time
+import threading
 import re
 import asyncio
-import os # <-- НОВЫЙ ИМПОРТ: для работы с переменными окружения Render.com
-import sys # <-- НОВЫЙ ИМПОРТ: для безопасного выхода, если токен не найден
+import os # <-- ДОБАВЛЕНО ДЛЯ РАБОТЫ С ПЕРЕМЕННЫМИ ОКРУЖЕНИЯ
 from typing import Dict, Any, List, Optional
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError 
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError 
+from bs4 import BeautifulSoup, Tag
+# НОВЫЕ ИМПОРТЫ ДЛЯ РАБОТЫ С ВРЕМЕННЫМИ ЗОНАМИ
 from datetime import datetime, timezone, timedelta
-import pytz 
 
 # =================================================================
 # 1. КОНСТАНТЫ И НАСТРОЙКИ
 # =================================================================
 
-# !!! АДАПТАЦИЯ ДЛЯ RENDER: Чтение из переменной окружения !!!
+# !!! ВАЖНО: Токен берется из переменной окружения Render для безопасности !!!
+# На Render это должна быть переменная окружения с именем DISCORD_BOT_TOKEN.
 BOT_TOKEN = os.environ.get('BOT_TOKEN') 
 
-# URL для скрапинга. 
+# URL для скрапинга. ИЗМЕНЕНИЕ: Форсируем UTC, чтобы время было независимо от хоста.
 URL = 'https://browse.wf/arbys#days=30&tz=utc&hourfmt=24' 
 CONFIG_FILE = 'config.json'
-
-# ИЗМЕНЕНИЕ: Увеличен интервал скрапинга до 10 минут для снижения нагрузки на хост
-SCRAPE_INTERVAL_SECONDS = 600  
-MISSION_UPDATE_INTERVAL_SECONDS = 10 
+SCRAPE_INTERVAL_SECONDS = 300  # Скрапинг раз в 5 минут (обновление данных)
+# ИЗМЕНЕНИЕ: Обновляем Discord-сообщение только после нового скрапинга.
+MISSION_UPDATE_INTERVAL_SECONDS = 300 
 MAX_UPCOMING_FIELD_LENGTH = 950 
 
 # --- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ---
@@ -42,20 +42,26 @@ FALLBACK_COLOR = 0xAAAAAA
 
 # --- КОНСТАНТЫ СТИЛИЗАЦИИ И ЭМОДЗИ ---
 EMOJI_NAMES = {
+    # Фракции
     "Гринир": "gren", "Корпус": "corp", "Зараженные": "infest", 
     "Орокин": "orokin", "Шёпот": "murmur",
+    # Тиры
     "S": "S_", "A": "A_", "B": "B_", "C": "C_", "D": "D_", "F": "F_",
-    "ВИТУС": "vitus", 
-    "КУВА": "kuva"    
+    # Новые (для шапки)
+    "ВИТУС": "vitus", # Vitus
+    "КУВА": "kuva"    # Kuva
 }
+# Словари для хранения реально найденных строк эмодзи (с ID)
 RESOLVED_EMOJIS: Dict[str, str] = {}
 FACTION_EMOJIS_FINAL: Dict[str, str] = {} 
 TIER_EMOJIS_FINAL: Dict[str, str] = {}
 FALLBACK_EMOJI = "❓" 
 
+# Новые ключи для удобства
 KUVA_EMOJI_KEY = "КУВА"
 VITUS_EMOJI_KEY = "ВИТУС"
 
+# --- КОНСТАНТЫ ФРАКЦИОННЫХ ИЗОБРАЖЕНИЙ (ДЛЯ ТАЙЛСЕТА) ---
 FACTION_IMAGE_URLS = {
     "Зараженные": "https://images-ext-1.discordapp.net/external/9_z1utcRwJxSSw4n6ebRLAzqynWnAJAVJDphsjyrg9E/https/assets.empx.cc/Lotus/Interface/Graphics/WorldStatePanel/Infested.png?format=webp&quality=lossless",
     "Гринир": "https://images-ext-1.discordapp.net/external/Wmh0isPGDXG8s1_xJKjSW_F6CHl6aBQXoRIINUdvm0g/https/assets.empx.cc/Lotus/Interface/Graphics/WorldStatePanel/Grineer.png?format=webp&quality=lossless",
@@ -64,6 +70,7 @@ FACTION_IMAGE_URLS = {
     "Шёпот": "https://i.imgur.com/gK2oQ9Z.png"
 }
 
+# --- ПОЛНАЯ РУСИФИКАЦИЯ ТИПОВ МИССИЙ ---
 MISSION_TYPE_TRANSLATIONS = {
     "Exterminate": "Зачистка", "Capture": "Захват", "Mobile Defense": "Мобильная оборона",
     "Defense": "Оборона", "Survival": "Выживание", "Interception": "Перехват",
@@ -75,6 +82,7 @@ MISSION_TYPE_TRANSLATIONS = {
     "Defection": "Перебежчики", 
     "Unknown Mission": "Неизвестный тип"
 }
+
 
 # =================================================================
 # 2. УТИЛИТЫ И КОНФИГУРАЦИЯ
@@ -90,7 +98,7 @@ def load_config():
     DEFAULT_CONFIG = {
         "ARBITRATION_CHANNEL_ID": None, 
         'LAST_ARBITRATION_MESSAGE_ID': None,
-        'LAST_MENTIONED_NODE': None
+        'LAST_MENTIONED_NODE': None # Отслеживание последней упомянутой ноды
     } 
     global CONFIG
     try:
@@ -152,23 +160,26 @@ def resolve_custom_emojis(bot: commands.Bot):
     
     print("Начало поиска эмодзи...")
     
+    # 1. Находим все нужные эмодзи
     for key_name, emoji_name in EMOJI_NAMES.items():
         custom_emoji = discord.utils.get(bot.emojis, name=emoji_name)
         if custom_emoji:
             RESOLVED_EMOJIS[emoji_name] = str(custom_emoji)
         else:
-            # Используем имя эмодзи в качестве ключа
             RESOLVED_EMOJIS[emoji_name] = f"❓{key_name}❓" 
 
+    # 2. Определяем фоллбэк
     orokin_emoji_name = EMOJI_NAMES.get("Орокин")
     orokin_emoji = RESOLVED_EMOJIS.get(orokin_emoji_name, "❓")
     FALLBACK_EMOJI = orokin_emoji if not orokin_emoji.startswith("❓") else "❓"
     
+    # 3. Заполняем финальный словарь фракций
     for key in ["Гринир", "Корпус", "Зараженные", "Орокин", "Шёпот"]:
         emoji_name = EMOJI_NAMES.get(key)
         final_emoji = RESOLVED_EMOJIS.get(emoji_name, FALLBACK_EMOJI)
         FACTION_EMOJIS_FINAL[key] = final_emoji if not final_emoji.startswith("❓") else FALLBACK_EMOJI
              
+    # 4. Заполняем финальный словарь тиров
     for tier in ["S", "A", "B", "C", "D", "F"]:
         emoji_name = EMOJI_NAMES.get(tier)
         final_emoji = RESOLVED_EMOJIS.get(emoji_name, tier) 
@@ -191,11 +202,14 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
     all_missions = log_div.find_all(['b', 'span'], attrs={'data-timestamp': True})
     
     parsed_missions = []
-    msk_tz = pytz.timezone('Europe/Moscow') 
+    # --- НОВЫЙ ОБЪЕКТ ЧАСОВОГО ПОЯСА МСК (UTC+3) ---
+    msk_tz = timezone(timedelta(hours=3)) 
     
     for tag in all_missions:
         try:
             text_content = tag.text.strip()
+            
+            # Нам больше не нужно парсить '00:00 •' из строки, так как мы будем считать его сами
             
             tier_bonus_match = re.search(r'\((.+?)\s*tier(?:,\s*(.+?))?\)$', text_content)
             if not tier_bonus_match: continue
@@ -217,11 +231,13 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
             location_combined = f"{node}, {planet}" 
 
             start_timestamp = int(tag.attrs['data-timestamp'])
-            end_timestamp = start_timestamp + 3600
+            end_timestamp = start_timestamp + 3600 # Missions last 1 hour
             
+            # --- НОВОЕ: Конвертация времени UTC в МСК для отображения ---
             utc_dt = datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
             msk_dt = utc_dt.astimezone(msk_tz)
             msk_start_time_display = msk_dt.strftime('%H:%M')
+            # -----------------------------------------------------------
             
             parsed_missions.append({
                 "Tier": tier,
@@ -231,13 +247,14 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
                 "Planet": planet,
                 "Location": location_combined,
                 "Bonus": bonus,
-                "StartTimeDisplay": msk_start_time_display,
+                "StartTimeDisplay": msk_start_time_display, # Используем МСК время
                 "StartTimestamp": start_timestamp,
                 "EndTimestamp": end_timestamp,
             })
         except Exception as e:
             continue
 
+    # 4. Determine Current and Upcoming Missions
     now = current_scrape_time
     parsed_missions.sort(key=lambda m: m['StartTimestamp'])
     
@@ -253,6 +270,7 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
         elif start > now:
             upcoming_missions_list.append(mission)
 
+    # --- Current / Next Mission ---
     target_mission = current_mission
     is_active = True
     
@@ -262,6 +280,7 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
             is_active = False
 
     if target_mission:
+        # Расчет времени всегда точен, т.к. основан на разнице timestamp (секунды)
         time_diff = target_mission['EndTimestamp'] - now if is_active else target_mission['StartTimestamp'] - now
         
         hours = int(time_diff // 3600)
@@ -273,6 +292,9 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
 
         time_status = f"осталось {time_raw_display}" if is_active else f"через {time_raw_display}"
         
+        # НОВОЕ: Целевой UNIX-таймстамп для Discord-таймера (секунды с эпохи)
+        target_time_for_discord = target_mission['EndTimestamp'] if is_active else target_mission['StartTimestamp']
+        
         schedule["Current"] = {
             "Tier": target_mission["Tier"],
             "Name": target_mission["Type"], 
@@ -282,6 +304,7 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
             "Tileset": target_mission["Faction"], 
             "Bonus": target_mission["Bonus"],
             "TimeRaw": time_status,
+            "TargetTimestamp": target_time_for_discord, # <--- ДОБАВЛЕНО
             "StartTimestamp": target_mission["StartTimestamp"],
             "IsActive": is_active
         }
@@ -289,6 +312,8 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
         schedule["Current"] = {"Tier": "N/A", "TimeRaw": "Нет данных", "IsActive": False, "Node": "N/A"}
 
 
+    # --- Upcoming Missions ---
+    
     for mission in upcoming_missions_list:
         time_until_start = mission['StartTimestamp'] - now
         
@@ -300,6 +325,9 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
                 time_raw_display = f"через {hours}:{minutes:02}"
             else:
                 time_raw_display = f"через {minutes}м"
+            
+            # НОВОЕ: Целевой UNIX-таймстамп для Discord-таймера
+            target_time_for_discord = mission['StartTimestamp']
 
             schedule["Upcoming"].append({
                 "Tier": mission["Tier"], 
@@ -309,57 +337,61 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
                 "StartTimeDisplay": mission["StartTimeDisplay"], 
                 "TimeRaw": time_raw_display,
                 "TimeInSeconds": time_until_start,
+                "TargetTimestamp": target_time_for_discord, # <--- ДОБАВЛЕНО ДЛЯ БЛИЖАЙШИХ
             })
             
     schedule["Upcoming"] = schedule["Upcoming"][:20] 
     
     return schedule
 
-async def parse_warframe_state_async():
-    """Асинхронный скрапинг данных с browse.wf и парсинг Арбитражей с Playwright."""
-    print(f"[{time.strftime('%H:%M:%S')}] 🔄 Запуск асинхронного скрапинга Арбитража...")
+def parse_warframe_state():
+    """Скрапинг данных с browse.wf и парсинг Арбитражей."""
+    print(f"[{time.strftime('%H:%M:%S')}] 🔄 Запуск скрапинга Арбитража...")
     current_scrape_time = time.time()
     results = {"ArbitrationSchedule": {}}
     try:
-        # Playwright не заблокирует асинхронный цикл благодаря async_playwright()
-        async with async_playwright() as p: 
-            # Аргументы для контейнеризированных сред (Render.com)
-            browser = await p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox', '--no-zygote'] 
-            )
-            page = await browser.new_page()
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
             page.set_default_timeout(60000)
-            
-            await page.goto(URL, wait_until="domcontentloaded") 
-            await page.wait_for_selector('#log', timeout=30000) 
-            await asyncio.sleep(1.5) 
-            
-            content = await page.content()
-            soup = BeautifulSoup(content, 'html.parser')
-            await browser.close()
+            page.goto(URL, wait_until="domcontentloaded") 
+            page.wait_for_selector('#log', timeout=30000) 
+            time.sleep(1.5) 
+            soup = BeautifulSoup(page.content(), 'html.parser')
+            browser.close()
             
             results["ArbitrationSchedule"] = parse_arbitration_schedule(soup, current_scrape_time)
             
     except PlaywrightTimeoutError:
         print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Таймаут при загрузке данных.")
     except Exception as e:
-        print(f"[{time.strftime('%H:%M:%S')}] 🚨 Критическая ошибка скрапинга Playwright: {e}")
-        import traceback
-        print(traceback.format_exc())
+        print(f"[{time.strftime('%H:%M:%S')}] 🚨 Критическая ошибка скрапинга: {e}")
 
     arb_tier = results["ArbitrationSchedule"]["Current"].get("Tier", "N/A")
     print(f"[{time.strftime('%H:%M:%S')}] ✅ Скрапинг завершен. Арбитраж: {arb_tier}.")
     set_current_state(results, current_scrape_time)
     return results
 
+def mission_update_loop():
+    """Постоянный цикл для периодического скрапинга в фоновом потоке."""
+    while True:
+        parse_warframe_state()
+        time.sleep(SCRAPE_INTERVAL_SECONDS)
+
+def start_scraper():
+    """Запускает цикл скрапинга в отдельном потоке."""
+    tracker_thread = threading.Thread(target=mission_update_loop, daemon=True)
+    tracker_thread.start()
+
+
 # =================================================================
 # 4. ЛОГИКА ОБНОВЛЕНИЯ КАНАЛА
 # =================================================================
 
 async def send_or_edit_message(message_id_key: str, channel: discord.TextChannel, embed: discord.Embed, content: str = None):
-    """Отправляет или редактирует сообщение в канале."""
+    """Отправляет или редактирует сообщение в канале. Добавлен параметр content."""
     
+    # Удаляем content, если он пустой, чтобы не редактировать сообщение без необходимости
     if content is None or content.strip() == "":
         content = None
     
@@ -374,6 +406,7 @@ async def send_or_edit_message(message_id_key: str, channel: discord.TextChannel
             except discord.NotFound:
                 pass 
         
+        # Передаем content здесь
         sent_message = await channel.send(content=content, embed=embed)
         CONFIG[message_id_key] = sent_message.id
         save_config()
@@ -392,36 +425,36 @@ async def update_arbitration_channel(bot: commands.Bot):
     if not arb_id: return
     arb_channel = bot.get_channel(arb_id)
     if not arb_channel: return
-    
-    # Запускаем скрапинг принудительно, если данные сильно устарели
-    if time.time() - LAST_SCRAPE_TIME > SCRAPE_INTERVAL_SECONDS + 60:
-         print(f"[{time.strftime('%H:%M:%S')}] ⚠️ Данные устарели. Принудительный скрапинг перед обновлением канала.")
-         await parse_warframe_state_async()
-
 
     data = CURRENT_MISSION_STATE.get("ArbitrationSchedule", {})
     
     current_arb = data.get("Current", {})
     upcoming = data.get("Upcoming", [])
     
+    # 1. Определение цвета, тира и статуса
     embed_tier = current_arb.get("Tier", "N/A").upper()
     embed_color = TIER_COLORS.get(embed_tier, FALLBACK_COLOR)
     tier_emoji = TIER_EMOJIS_FINAL.get(embed_tier, embed_tier) 
     time_raw = current_arb.get('TimeRaw', 'N/A')
     is_active = current_arb.get('IsActive', False)
+    target_ts = current_arb.get('TargetTimestamp') # <-- НОВОЕ: Целевой таймстамп
     
+    # 2. Эмодзи и Изображение Фракции
     faction_name = current_arb.get('Tileset', 'N/A')
     faction_emoji = FACTION_EMOJIS_FINAL.get(faction_name, FALLBACK_EMOJI)
     faction_url = get_faction_image_url(faction_name)
     
+    # 3. Получение эмодзи Кувы и Витуса
     vitus_emoji_name = EMOJI_NAMES.get(VITUS_EMOJI_KEY)
     kuva_emoji_name = EMOJI_NAMES.get(KUVA_EMOJI_KEY)
     vitus_emoji = RESOLVED_EMOJIS.get(vitus_emoji_name, "⭐")
     kuva_emoji = RESOLVED_EMOJIS.get(kuva_emoji_name, "⚡️")
 
+    # 4. Линковка роли (ДИНАМИЧЕСКИЙ ПОИСК И ЛОГИКА УВЕДОМЛЕНИЯ)
     content_to_send: Optional[str] = None
     node_name = current_arb.get('Node') 
     
+    # --- Логика Уведомления и Удержания ---
     current_node_key = f"{node_name}_{current_arb.get('StartTimestamp')}" if is_active else None
     last_mentioned_key = CONFIG.get('LAST_MENTIONED_NODE')
     
@@ -430,39 +463,56 @@ async def update_arbitration_channel(bot: commands.Bot):
     if is_active and node_name and arb_channel.guild:
         
         if current_node_key != last_mentioned_key:
+            # СЛУЧАЙ 1: НОВАЯ АКТИВНАЯ МИССИЯ (нужно уведомить и сохранить ключ)
             should_find_role = True
             CONFIG['LAST_MENTIONED_NODE'] = current_node_key
             save_config()
+            print(f"[{time.strftime('%H:%M:%S')}] DEBUG: Активировано УВЕДОМЛЕНИЕ для ноды: {node_name}")
             
         elif current_node_key == last_mentioned_key:
+            # СЛУЧАЙ 2: МИССИЯ ПРОДОЛЖАЕТСЯ (нужно только сохранить упоминание в сообщении)
             should_find_role = True
             
     elif not is_active and last_mentioned_key:
+        # СЛУЧАЙ 3: МИССИЯ ЗАКОНЧИЛАСЬ (сбрасываем ключ, чтобы очистить упоминание)
         CONFIG['LAST_MENTIONED_NODE'] = None
         save_config()
 
     
     if should_find_role and node_name and arb_channel.guild:
+        # Ищем роль по имени (точное совпадение)
         target_role = discord.utils.get(arb_channel.guild.roles, name=node_name)
         
         if target_role:
+            # Устанавливаем упоминание, которое будет отображаться (и уведомит только в СЛУЧАЕ 1)
             content_to_send = f"{target_role.mention}" 
+            print(f"[{time.strftime('%H:%M:%S')}] DEBUG: Роль найдена для ноды {node_name}. Mention: {content_to_send}")
         else:
-            pass
+            print(f"[{time.strftime('%H:%M:%S')}] DEBUG: Роль НЕ НАЙДЕНА для ноды: {node_name}. Проверьте точное совпадение имени.")
 
+    # --- 3. EMBED CONSTRUCTION ---
     embed = discord.Embed(
         title=f"{vitus_emoji} РАСПИСАНИЕ АРБИТРАЖЕЙ",
         url="https://browse.wf/arbys", 
         color=embed_color
     )
     
+    # --- A. Current / Next Active Mission ---
     if current_arb.get("Name"):
         
         tier_display = f"{tier_emoji} Тир" if embed_tier != "N/A" else ""
         
+        # НОВОЕ: Формирование строки с нативным Discord-таймером
+        if target_ts:
+            discord_timer = f"<t:{target_ts}:R>" # Формат :R - относительное время ("через 5 минут")
+            time_line = f"завершится {discord_timer}" if is_active else f"начнется {discord_timer}"
+        else:
+            time_line = f"`{time_raw}`" # Фоллбэк, если таймстамп не найден
+
         if not is_active:
             title_line = f"{kuva_emoji} **СЛЕДУЮЩИЙ АРБИТРАЖ ({tier_display}):**"
         else:
+            # Заголовок без упоминания
             title_line = f"{kuva_emoji} **ТЕКУЩИЙ АРБИТРАЖ ({tier_display}):**" 
             
         description_value = (
@@ -470,7 +520,7 @@ async def update_arbitration_channel(bot: commands.Bot):
             f"Локация: **{current_arb.get('Location', 'N/A')}**\n"
             f"Враг: {faction_emoji} **{faction_name}**\n"
             f"Бонус: **{current_arb.get('Bonus', 'N/A')}**\n"
-            f"Время: **`{time_raw}`**"
+            f"Время: **{time_line}**" # <--- Используем новую строку с Discord-таймером
         )
         embed.add_field(name=title_line, value=description_value, inline=False)
         
@@ -481,6 +531,7 @@ async def update_arbitration_channel(bot: commands.Bot):
         embed.description = "**Актуальное расписание миссий не найдено.**\nПожалуйста, подождите следующего скрапинга. (Тир: N/A)"
         embed.color = discord.Color.red()
         
+    # --- B. Upcoming Missions ---
     upcoming_lines = []
     UPCOMING_LIMIT = 5 
     
@@ -491,8 +542,11 @@ async def update_arbitration_channel(bot: commands.Bot):
             upc_tier_emoji = TIER_EMOJIS_FINAL.get(m['Tier'], m['Tier'])
             upc_faction_emoji = FACTION_EMOJIS_FINAL.get(m['Faction'], FALLBACK_EMOJI)
             
+            # ВНИМАНИЕ: Здесь используем m['TargetTimestamp'] для нативного таймера
+            upc_timer = f"<t:{m['TargetTimestamp']}:R>" if m.get('TargetTimestamp') else f"**{m['TimeRaw']}**"
+
             line = (
-                f"{upc_tier_emoji} | {m['StartTimeDisplay']} • {upc_faction_emoji} ({m['Location']}) **{m['TimeRaw']}**"
+                f"{upc_tier_emoji} | {m['StartTimeDisplay']} • {upc_faction_emoji} ({m['Location']}) {upc_timer}"
             )
             upcoming_lines.append(line)
     
@@ -507,6 +561,7 @@ async def update_arbitration_channel(bot: commands.Bot):
         inline=False
     )
     
+    # --- C. Tier-Specific Highlights ---
     TIERS_TO_HIGHLIGHT = ["S", "A", "B"]
 
     embed.add_field(name="\u200b", value="— — — ВЫДЕЛЕННЫЕ ТИРЫ — — —", inline=False)
@@ -519,9 +574,13 @@ async def update_arbitration_channel(bot: commands.Bot):
         
         if next_mission:
             upc_faction_emoji = FACTION_EMOJIS_FINAL.get(next_mission['Faction'], FALLBACK_EMOJI)
+            
+            # НОВОЕ: Используем TargetTimestamp для выделенных тиров
+            next_timer = f"<t:{next_mission['TargetTimestamp']}:R>" if next_mission.get('TargetTimestamp') else f"**{next_mission['TimeRaw']}**"
+
             field_value = (
                 f"{upc_faction_emoji} ({next_mission['Location']})\n"
-                f"в **{next_mission['StartTimeDisplay']}** ({next_mission['TimeRaw']})"
+                f"начнется {next_timer}"
             )
             embed.add_field(name=field_name, value=field_value, inline=True)
         else:
@@ -530,6 +589,7 @@ async def update_arbitration_channel(bot: commands.Bot):
 
     embed.set_footer(text=f"Обновлено: {time.strftime('%H:%M:%S')} | Данные: browse.wf/arbys | Время: МСК (UTC+3)")
     
+    # ОТПРАВКА: content_to_send будет содержать упоминание, если миссия активна
     await send_or_edit_message('LAST_ARBITRATION_MESSAGE_ID', arb_channel, embed, content=content_to_send)
 
 
@@ -537,15 +597,10 @@ async def update_arbitration_channel(bot: commands.Bot):
 # 5. ОСНОВНОЙ КОД БОТА И КОМАНДЫ
 # =================================================================
 
-@tasks.loop(seconds=SCRAPE_INTERVAL_SECONDS)
-async def scrape_task():
-    """Задача Discord Tasks для периодического скрапинга."""
-    await parse_warframe_state_async() 
+# Запуск скрапинга в отдельном потоке
+start_scraper()
 
-@tasks.loop(seconds=MISSION_UPDATE_INTERVAL_SECONDS)
-async def mission_update_task():
-    await update_arbitration_channel(bot)
-
+# Убедитесь, что намерение 'guilds' включено
 intents = discord.Intents.default()
 intents.message_content = True 
 intents.guilds = True 
@@ -553,19 +608,25 @@ intents.emojis_and_stickers = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+@tasks.loop(seconds=MISSION_UPDATE_INTERVAL_SECONDS)
+async def mission_update_task():
+    """Задача Discord Tasks для периодического обновления только канала Арбитража (каждые 5 минут)."""
+    await update_arbitration_channel(bot)
+
 @bot.event
 async def on_ready():
     print(f'Бот готов: {bot.user}')
     
+    # 1. Разрешение эмодзи
     resolve_custom_emojis(bot)
     
-    print("Запуск первого скрапинга для инициализации данных...")
-    await parse_warframe_state_async() 
+    # 2. Ожидаем завершения первого скрапинга
+    while LAST_SCRAPE_TIME == 0:
+        await asyncio.sleep(1) 
         
+    # 3. Запуск цикла
     if CONFIG.get('ARBITRATION_CHANNEL_ID'):
-        print(f"Канал Арбитража настроен. Запуск циклов обновления...")
-        if not scrape_task.is_running():
-             scrape_task.start()
+        print(f"Канал Арбитража настроен. Запуск цикла обновления ({MISSION_UPDATE_INTERVAL_SECONDS}с)...")
         if not mission_update_task.is_running():
              mission_update_task.start()
     else:
@@ -579,13 +640,10 @@ async def set_arbitration_channel(ctx):
     CONFIG['ARBITRATION_CHANNEL_ID'] = ctx.channel.id
     save_config()
     
-    if not RESOLVED_EMOJIS: resolve_custom_emojis(bot) 
-    
-    if not scrape_task.is_running():
-        await parse_warframe_state_async()
-        scrape_task.start()
-        
     if not mission_update_task.is_running():
+        if not RESOLVED_EMOJIS: resolve_custom_emojis(bot) 
+        while LAST_SCRAPE_TIME == 0:
+            await asyncio.sleep(1)
         mission_update_task.start()
         
     await update_arbitration_channel(bot)
@@ -594,14 +652,13 @@ async def set_arbitration_channel(ctx):
 if __name__ == '__main__':
     if not BOT_TOKEN:
         print("\n\n-- КРИТИЧЕСКАЯ ОШИБКА --")
-        print("Переменная окружения 'DISCORD_BOT_TOKEN' не найдена.")
-        print("Пожалуйста, установите ее в настройках Render.com.")
-        sys.exit(1) # Завершаем работу, если токен не найден
-        
-    try:
-        bot.run(BOT_TOKEN) 
-    except discord.errors.LoginFailure:
-        print("\n\n-- ОШИБКА АВТОРИЗАЦИИ --")
-        print("Проверьте, правильно ли вы вставили BOT_TOKEN в переменные окружения Render.com!")
-    except Exception as e:
-        print(f"Произошла ошибка при запуске бота: {e}")
+        print("Переменная окружения 'DISCORD_BOT_TOKEN' не установлена.")
+        print("Пожалуйста, установите ее в настройках Render Environment.")
+    else:
+        try:
+            bot.run(BOT_TOKEN) 
+        except discord.errors.LoginFailure:
+            print("\n\n-- ОШИБКА АВТОРИЗАЦИИ --")
+            print("Проверьте, правильно ли вы установили токен бота в переменной окружения DISCORD_BOT_TOKEN.")
+        except Exception as e:
+            print(f"Произошла ошибка при запуске бота: {e}")
