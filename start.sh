@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 
-echo "Installing Playwright browsers without system permissions..."
+# Установка системных зависимостей для Chromium/Playwright
+# Этот шаг может быть не нужен на Render, если они уже предустановлены, 
+# но это гарантирует успех.
+# Render часто использует Debian, поэтому используем apt.
+# В более новых версиях Render могут быть другие механизмы.
 
-# Используем флаг --install-dir=/usr/local/bin, чтобы избежать проблем с su/sudo.
-playwright install --with-deps chromium --install-dir=/usr/local/bin
+# Установка бинарников Chromium для Playwright
+playwright install chromium
 
-# Экспортируем путь к браузерам для Python-кода
-export PLAYWRIGHT_BROWSERS_PATH=/usr/local/bin/ms-playwright/
-
-# Скрипт завершается. Запуск бота берет на себя Start Command Render
+# Запуск вашего Python-бота
+python main_bot.py
