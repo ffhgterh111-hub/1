@@ -1,4 +1,4 @@
 discord.py
 playwright
 beautifulsoup4
-requests
+pytz
