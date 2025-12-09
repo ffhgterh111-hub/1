@@ -8,18 +8,22 @@ import asyncio
 from typing import Dict, Any, List, Optional
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError 
 from bs4 import BeautifulSoup, Tag
-# НОВЫЕ ИМПОРТЫ ДЛЯ РАБОТЫ С ВРЕМЕННЫМИ ЗОНАМИ
 from datetime import datetime, timezone, timedelta
-import os
+import os 
+# НОВЫЕ ИМПОРТЫ ДЛЯ ВЕБ-СЕРВЕРА И МУЛЬТИПРОЦЕССИНГА
+import http.server
+import socketserver
+import multiprocessing 
+
 
 # =================================================================
 # 1. КОНСТАНТЫ И НАСТРОЙКИ
 # =================================================================
 
-# !!! ВАЖНО: ЗАМЕНИТЕ ЭТО НА ВАШ ТОКЕН И УБЕДИТЕСЬ, ЧТО ОН ЗАКРЫТ ОДИНАРНОЙ КАВЫЧКОЙ !!!
+# !!! ВАЖНО: ТОКЕН ЧИТАЕТСЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ RENDER.COM
 BOT_TOKEN = os.environ.get('BOT_TOKEN') 
 
-# URL для скрапинга. ИЗМЕНЕНИЕ: Форсируем UTC, чтобы время было независимо от хоста.
+# URL для скрапинга. Форсируем UTC, чтобы время было независимо от хоста.
 URL = 'https://browse.wf/arbys#days=30&tz=utc&hourfmt=24' 
 CONFIG_FILE = 'config.json'
 SCRAPE_INTERVAL_SECONDS = 300  # Скрапинг раз в 5 минут (обновление данных)
@@ -200,14 +204,12 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
     all_missions = log_div.find_all(['b', 'span'], attrs={'data-timestamp': True})
     
     parsed_missions = []
-    # --- НОВЫЙ ОБЪЕКТ ЧАСОВОГО ПОЯСА МСК (UTC+3) ---
+    # --- ОБЪЕКТ ЧАСОВОГО ПОЯСА МСК (UTC+3) ---
     msk_tz = timezone(timedelta(hours=3)) 
     
     for tag in all_missions:
         try:
             text_content = tag.text.strip()
-            
-            # Нам больше не нужно парсить '00:00 •' из строки, так как мы будем считать его сами
             
             tier_bonus_match = re.search(r'\((.+?)\s*tier(?:,\s*(.+?))?\)$', text_content)
             if not tier_bonus_match: continue
@@ -231,7 +233,7 @@ def parse_arbitration_schedule(soup: BeautifulSoup, current_scrape_time: float) 
             start_timestamp = int(tag.attrs['data-timestamp'])
             end_timestamp = start_timestamp + 3600 # Missions last 1 hour
             
-            # --- НОВОЕ: Конвертация времени UTC в МСК для отображения ---
+            # --- Конвертация времени UTC в МСК для отображения ---
             utc_dt = datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
             msk_dt = utc_dt.astimezone(msk_tz)
             msk_start_time_display = msk_dt.strftime('%H:%M')
@@ -338,7 +340,9 @@ def parse_warframe_state():
     """Скрапинг данных с browse.wf и парсинг Арбитражей."""
     print(f"[{time.strftime('%H:%M:%S')}] 🔄 Запуск скрапинга Арбитража...")
     current_scrape_time = time.time()
-    results = {"ArbitrationSchedule": {}}
+    # Гарантируем начальную структуру для избежания KeyError
+    results = {"ArbitrationSchedule": {"Current": {}, "Upcoming": []}} 
+    
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -350,6 +354,7 @@ def parse_warframe_state():
             soup = BeautifulSoup(page.content(), 'html.parser')
             browser.close()
             
+            # Убедитесь, что результаты парсинга правильно обновляют словарь results
             results["ArbitrationSchedule"] = parse_arbitration_schedule(soup, current_scrape_time)
             
     except PlaywrightTimeoutError:
@@ -357,7 +362,8 @@ def parse_warframe_state():
     except Exception as e:
         print(f"[{time.strftime('%H:%M:%S')}] 🚨 Критическая ошибка скрапинга: {e}")
 
-    arb_tier = results["ArbitrationSchedule"]["Current"].get("Tier", "N/A")
+    # Используем безопасный .get() для избежания KeyError, если скрапинг провалился
+    arb_tier = results.get("ArbitrationSchedule", {}).get("Current", {}).get("Tier", "N/A")
     print(f"[{time.strftime('%H:%M:%S')}] ✅ Скрапинг завершен. Арбитраж: {arb_tier}.")
     set_current_state(results, current_scrape_time)
     return results
@@ -381,7 +387,6 @@ def start_scraper():
 async def send_or_edit_message(message_id_key: str, channel: discord.TextChannel, embed: discord.Embed, content: str = None):
     """Отправляет или редактирует сообщение в канале. Добавлен параметр content."""
     
-    # Удаляем content, если он пустой, чтобы не редактировать сообщение без необходимости
     if content is None or content.strip() == "":
         content = None
     
@@ -396,7 +401,6 @@ async def send_or_edit_message(message_id_key: str, channel: discord.TextChannel
             except discord.NotFound:
                 pass 
         
-        # Передаем content здесь
         sent_message = await channel.send(content=content, embed=embed)
         CONFIG[message_id_key] = sent_message.id
         save_config()
@@ -524,7 +528,7 @@ async def update_arbitration_channel(bot: commands.Bot):
             upc_tier_emoji = TIER_EMOJIS_FINAL.get(m['Tier'], m['Tier'])
             upc_faction_emoji = FACTION_EMOJIS_FINAL.get(m['Faction'], FALLBACK_EMOJI)
             
-            # ВНИМАНИЕ: Здесь m['StartTimeDisplay'] всегда в МСК, благодаря новой логике парсинга
+            # Время всегда в МСК, благодаря конвертации в parse_arbitration_schedule
             line = (
                 f"{upc_tier_emoji} | {m['StartTimeDisplay']} • {upc_faction_emoji} ({m['Location']}) **{m['TimeRaw']}**"
             )
@@ -573,9 +577,6 @@ async def update_arbitration_channel(bot: commands.Bot):
 # 5. ОСНОВНОЙ КОД БОТА И КОМАНДЫ
 # =================================================================
 
-# Запуск скрапинга в отдельном потоке
-start_scraper()
-
 # Убедитесь, что намерение 'guilds' включено
 intents = discord.Intents.default()
 intents.message_content = True 
@@ -597,6 +598,7 @@ async def on_ready():
     resolve_custom_emojis(bot)
     
     # 2. Ожидаем завершения первого скрапинга
+    # Этот цикл теперь безопасен, так как скрапинг запускается до bot.run
     while LAST_SCRAPE_TIME == 0:
         await asyncio.sleep(1) 
         
@@ -625,16 +627,71 @@ async def set_arbitration_channel(ctx):
     await update_arbitration_channel(bot)
     await ctx.send(f"✅ Канал **Расписания Арбитражей** установлен на: {ctx.channel.mention} и запущен.", delete_after=10)
 
+
+# =================================================================
+# 6. ЛОГИКА ВЕБ-СЕРВЕРА ДЛЯ RENDER.COM
+# =================================================================
+
+class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+    """Простой обработчик для ответа на пинги Render."""
+    
+    def do_GET(self):
+        """Обрабатывает GET-запросы."""
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is alive and running.")
+        # Печать только для отладки, чтобы видеть в логах, что пинг пришел
+        # print(f"[{time.strftime('%H:%M:%S')}] 🩺 Health Check received.") 
+
+    def log_message(self, format, *args):
+        # Отключаем логирование HTTP-запросов, чтобы не забивать логи
+        return
+
+def start_web_server():
+    """Запускает веб-сервер на порту Render."""
+    # Render.com предоставляет порт через переменную окружения
+    try:
+        # Получаем порт из окружения. По умолчанию 8080, если не найдено
+        PORT = int(os.environ.get("PORT", 8080)) 
+    except ValueError:
+        PORT = 8080
+
+    print(f"[{time.strftime('%H:%M:%S')}] 🌐 Запуск веб-сервера на порту {PORT}...")
+    
+    try:
+        # Запускаем сервер на всех интерфейсах ('') и используем наш обработчик
+        with socketserver.TCPServer(("", PORT), HealthCheckHandler) as httpd:
+            # Делаем это с помощью try-except, чтобы избежать зависания
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"[{time.strftime('%H:%M:%S')}] 🚨 Критическая ошибка веб-сервера: {e}")
+        # Если веб-сервер упал, бот скоро уснет.
+
+# =================================================================
+# 7. ЗАПУСК ВСЕХ КОМПОНЕНТОВ
+# =================================================================
+
 if __name__ == '__main__':
     try:
-        if BOT_TOKEN == 'MTQ0MjczMTczNzQ1MTk4NzE2MA.GAaNCy.Y1as9m_1qxxUd8eWCONBo7md3Jd9iYwf3nXw0U':
-            print("\n\n-- ВНИМАНИЕ --")
-            print("Пожалуйста, замените BOT_TOKEN на ваш реальный Discord-токен.")
+        if BOT_TOKEN is None:
+            print("\n\n-- КРИТИЧЕСКАЯ ОШИБКА --")
+            print("Переменная окружения 'BOT_TOKEN' не найдена. Установите ее на Render.com.")
+            exit(1)
             
+        # 1. Запуск веб-сервера в отдельном процессе (обязательно для Web Service Render)
+        # Используем multiprocessing, чтобы гарантировать, что он не блокирует Discord.py
+        web_process = multiprocessing.Process(target=start_web_server, daemon=True)
+        web_process.start()
+
+        # 2. Запуск цикла скрапинга в отдельном потоке (threading)
+        start_scraper()
+
+        # 3. Запуск Discord бота (блокирующий вызов)
         bot.run(BOT_TOKEN) 
+        
     except discord.errors.LoginFailure:
         print("\n\n-- ОШИБКА АВТОРИЗАЦИИ --")
         print("Проверьте, правильно ли вы вставили BOT_TOKEN!")
     except Exception as e:
-
         print(f"Произошла ошибка при запуске бота: {e}")
