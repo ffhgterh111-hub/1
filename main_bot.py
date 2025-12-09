@@ -23,9 +23,9 @@ BOT_TOKEN = os.environ.get('BOT_TOKEN')
 # URL для скрапинга. ИЗМЕНЕНИЕ: Форсируем UTC, чтобы время было независимо от хоста.
 URL = 'https://browse.wf/arbys#days=30&tz=utc&hourfmt=24' 
 CONFIG_FILE = 'config.json'
-SCRAPE_INTERVAL_SECONDS = 300  # Скрапинг раз в 5 минут (обновление данных)
+SCRAPE_INTERVAL_SECONDS = 20  # Скрапинг раз в 5 минут (обновление данных)
 # ИЗМЕНЕНИЕ: Обновляем Discord-сообщение только после нового скрапинга.
-MISSION_UPDATE_INTERVAL_SECONDS = 300 
+MISSION_UPDATE_INTERVAL_SECONDS = 20 
 MAX_UPCOMING_FIELD_LENGTH = 950 
 
 # --- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ---
@@ -662,3 +662,4 @@ if __name__ == '__main__':
             print("Проверьте, правильно ли вы установили токен бота в переменной окружения DISCORD_BOT_TOKEN.")
         except Exception as e:
             print(f"Произошла ошибка при запуске бота: {e}")
+
