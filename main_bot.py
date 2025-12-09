@@ -10,6 +10,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 from bs4 import BeautifulSoup, Tag
 # НОВЫЕ ИМПОРТЫ ДЛЯ РАБОТЫ С ВРЕМЕННЫМИ ЗОНАМИ
 from datetime import datetime, timezone, timedelta
+import os
 
 # =================================================================
 # 1. КОНСТАНТЫ И НАСТРОЙКИ
@@ -635,4 +636,5 @@ if __name__ == '__main__':
         print("\n\n-- ОШИБКА АВТОРИЗАЦИИ --")
         print("Проверьте, правильно ли вы вставили BOT_TOKEN!")
     except Exception as e:
+
         print(f"Произошла ошибка при запуске бота: {e}")
